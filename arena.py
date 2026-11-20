@@ -66,19 +66,20 @@ class Arena:
         dx, dy = direction
         radius = stats["radius"]
         step = stats["step_up"]
-        for along in range(2, math.ceil(distance) + 2, 2):
+        max_rise = max(step, math.tan(math.radians(stats["max_slope_deg"])))
+        for along in range(1, math.ceil(distance) + 1):
             forward = min(distance, along)
             px, py = x + dx * forward, y + dy * forward
             if not self.within_bounds(px, py, radius):
-                return max(0.0, forward - 2)
+                return max(0.0, forward - 1)
             floor = self.ground(px, py)
-            if floor > z + step + 0.25:
-                return max(0.0, forward - 2)
+            if floor > z + max_rise:
+                return max(0.0, forward - 1)
             for offset in (0, radius, -radius):
                 sx, sy = px - dy * offset, py + dx * offset
                 for base, top in self.spans(sx, sy):
                     if top > z + step + 0.25 and base < z + stats["height"]:
-                        return max(0.0, forward - 2)
+                        return max(0.0, forward - 1)
             # Update the probe's foot height on ordinary slopes, without dropping off roofs.
             if floor >= z - 2:
                 z = floor

@@ -3,6 +3,7 @@ import math
 
 from arena import Arena
 import mechfight as mf
+from navigation import GroundRouter
 
 
 WEAPONS = ("gun", "mortar", "laser", "lightning")
@@ -31,11 +32,12 @@ def unit(yaw):
 
 
 class Bot:
-    name = "Oval Runner"
+    name = "Oval Runner v2"
 
     def __init__(self, hello):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
+        self.router = GroundRouter(self.arena)
         self.last_move = (0, 0)
         self.attacked_until = -1
         self.attacker_yaw = 0
@@ -44,6 +46,8 @@ class Bot:
         self.detour_until = -1
         self.detour_side = 1 if hello["seed"] % 2 else -1
         self.detour_heading = None
+        self.jet_until = -1
+        self.jet_retry_at = -1
 
     def act(self, obs):
         me = obs["self"]
@@ -76,7 +80,7 @@ class Bot:
         next_distance = distance(pos, next_center)
         outside_buffer = distance(pos, zone["center"]) > max(0, zone["radius"] - 10)
         urgent = (not me["in_zone"] or
-                  next_distance - safe_radius > stats["walk_speed"] * max(0, remaining - 10))
+                  1.35 * (next_distance - safe_radius) > stats["walk_speed"] * max(0, remaining - 10))
         goal = next_center if next_distance > safe_radius or outside_buffer else pos[:2]
         if next_radius == 0:
             goal = next_center
@@ -133,13 +137,22 @@ class Bot:
                 dx, dy = unit(away)
                 goal = (pos[0] + dx * 28, pos[1] + dy * 28)
 
-        move, jump = self.navigate(me, goal, zone, now, away, urgent)
+        waypoint = self.router.waypoint(pos, goal, stats, zone, now)
+        routed = waypoint != tuple(goal[:2])
+        move, jump = self.navigate(me, waypoint, zone, now, away, urgent, routed)
         self.last_move = move
+        # A local detour can stall in a disconnected ground region. Try one short
+        # climb only when the zone makes waiting costly and the battery can support it.
+        if (urgent and not routed and self.detour_heading is not None and me["grounded"]
+                and now >= self.jet_retry_at and me["energy"] > me["max_energy"] * 0.55):
+            jump = True
+            self.jet_until = now + 1.4
+            self.jet_retry_at = now + 7
         action["move"] = list(move)
         action["jump"] = jump
         reserve = me["max_energy"] * (0.14 if urgent else 0.34)
         action["boost"] = bool(
-            (jump or (not me["grounded"] and urgent) or
+            (jump or (not me["grounded"] and now < self.jet_until) or
              (me["grounded"] and (urgent or fleeing) and math.hypot(*move) > 0.75))
             and me["energy"] > reserve
         )
@@ -189,7 +202,7 @@ class Bot:
             )), slot
         return None
 
-    def navigate(self, me, goal, zone, now, away, urgent):
+    def navigate(self, me, goal, zone, now, away, urgent, routed=False):
         pos, stats = me["pos"], me["stats"]
         dist = distance(pos, goal)
         # Detect sustained lack of progress and keep turning the same way around the obstacle.
@@ -200,7 +213,7 @@ class Bot:
                 if self.detour_heading is None:
                     self.detour_heading = bearing(pos, goal) + self.detour_side * math.pi / 2
             self.watch_position, self.watch_time = pos[:2], now
-        if now >= self.detour_until:
+        if now >= self.detour_until or routed:
             self.detour_heading = None
         if dist < 0.65:
             return (0, 0), False
@@ -225,7 +238,7 @@ class Bot:
             if self.detour_heading is not None:
                 score += 5 * math.cos(delta(yaw, preferred))
             if away is not None:
-                score += (0.3 if urgent else 1.0) * clear * math.cos(delta(yaw, away))
+                score += (0.3 if urgent else 1.0) * clear * math.cos(delta(yaw, away)) * (0.35 if routed else 1.0)
             if best is None or score > best[0]:
                 best = score, (dx, dy), clear
         if best:
