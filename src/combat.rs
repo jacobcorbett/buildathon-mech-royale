@@ -243,6 +243,13 @@ pub struct Hazard {
 }
 
 impl Hazard {
+    pub fn shooter_bearing(&self) -> Option<f64> {
+        match self.approach {
+            Approach::Bullet([vx, vy]) => Some((-vy).atan2(-vx)),
+            Approach::Blast(_) => None,
+        }
+    }
+
     pub fn dodge_heading(&self, side: f64) -> f64 {
         match self.approach {
             Approach::Bullet([vx, vy]) => vy.atan2(vx) + side * std::f64::consts::FRAC_PI_2,

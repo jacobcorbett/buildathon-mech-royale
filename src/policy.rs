@@ -51,6 +51,7 @@ pub struct Bot {
     jet_until: f64,
     jet_retry: f64,
     sprinting: bool,
+    escape_plan: Option<(Point, f64)>,
 }
 
 struct Movement<'a> {
@@ -87,6 +88,7 @@ impl Bot {
             jet_until: -1.0,
             jet_retry: -1.0,
             sprinting: false,
+            escape_plan: None,
         })
     }
 
@@ -154,7 +156,19 @@ impl Bot {
                 .copied()
                 .find(|actor| actor["id"].as_u64() == Some(id))
         });
-        let threat = attacker.or(pressure.first().copied());
+        let hazards = combat::incoming(&self.arena, &self.config, me, &obs["projectiles"]);
+        let shooter_bearing = hazards.iter().find_map(Hazard::shooter_bearing);
+        let shot_threat = shooter_bearing.and_then(|yaw| {
+            actors
+                .iter()
+                .copied()
+                .filter(|enemy| {
+                    range(start, enemy) < 120.0
+                        && angle_delta(bearing(start, xy(&enemy["pos"])), yaw).abs() < 0.34
+                })
+                .min_by(|a, b| range(start, a).total_cmp(&range(start, b)))
+        });
+        let threat = shot_threat.or(attacker).or(pressure.first().copied());
         let danger = threat.is_some() || attacked;
         let safe_radius = zone.next_radius - (zone.next_radius * 0.25).min(22.0);
         let future_gap = distance(start, zone.next) - safe_radius;
@@ -287,6 +301,7 @@ impl Bot {
         let engagement = finish.or(duel);
         let fleeing = engagement.is_none()
             && (attacked
+                || shooter_bearing.is_some()
                 || threat.is_some_and(|enemy| {
                     injured || pressure.len() > 1 || range(start, enemy) < 65.0
                 }));
@@ -302,15 +317,30 @@ impl Bot {
             zone_destination = false;
         }
         let away = fleeing.then(|| {
-            threat.map_or(self.attacker_yaw, |enemy| bearing(start, xy(&enemy["pos"]))) + PI
+            threat.map_or(shooter_bearing.unwrap_or(self.attacker_yaw), |enemy| {
+                bearing(start, xy(&enemy["pos"]))
+            }) + PI
         });
         if let Some(yaw) = away {
             if early_equip.is_none() && !urgent && zone.next_radius > 0.0 {
-                goal = escape_goal(start, yaw, zone, safe_radius);
+                let current = self.escape_plan.filter(|(point, until)| {
+                    now < *until
+                        && distance(start, *point) > 4.0
+                        && distance(*point, zone.center) < zone.radius - 4.0
+                });
+                goal = current.map_or_else(
+                    || cover_escape(&self.arena, me, yaw, zone, safe_radius, &pressure),
+                    |(point, _)| point,
+                );
+                if current.is_none() {
+                    self.escape_plan = Some((goal, now + 0.9));
+                }
                 zone_destination = false;
             }
         }
-        let hazards = combat::incoming(&self.arena, &self.config, me, &obs["projectiles"]);
+        if !fleeing || urgent {
+            self.escape_plan = None;
+        }
         if let Some(shot) = hazards.first().filter(|_| distance(start, goal) < 3.0) {
             goal = offset(start, unit(shot.dodge_heading(self.side)), 8.0);
             zone_destination = false;
@@ -567,6 +597,57 @@ fn can_finish(me: &Value, enemy: &Value, start: Point) -> bool {
             .is_some_and(|hp| hp > 0.0 && hp < (max_hp * 0.32).min(420.0))
 }
 
+fn cover_escape(
+    arena: &Arena,
+    me: &Value,
+    yaw: f64,
+    zone: Zone,
+    safe_radius: f64,
+    enemies: &[&Value],
+) -> Point {
+    let pos = xyz(&me["pos"]);
+    let start = flat(pos);
+    let body = Body::from_stats(&me["stats"]);
+    let mut best = (
+        f64::NEG_INFINITY,
+        escape_goal(start, yaw, zone, safe_radius),
+    );
+    for offset_deg in [
+        0.0_f64, 30.0, -30.0, 60.0, -60.0, 90.0, -90.0, 120.0, -120.0, 150.0, -150.0, 180.0,
+    ] {
+        let shift = offset_deg.to_radians();
+        let direction = unit(yaw + shift);
+        let travel = arena.travel(pos, direction, 24.0, body);
+        if travel < 9.0 {
+            continue;
+        }
+        let end = offset(start, direction, travel);
+        let overflow = (distance(end, zone.center) - zone.radius + 8.0).max(0.0);
+        let future_overflow = (distance(end, zone.next) - safe_radius + 4.0).max(0.0);
+        let mut score =
+            11.0 * shift.cos() + 0.22 * travel - 3.0 * overflow - 0.85 * future_overflow;
+        for enemy in enemies.iter().take(4) {
+            let [ex, ey, ez] = xyz(&enemy["pos"]);
+            let before = distance(start, [ex, ey]);
+            let after = distance(end, [ex, ey]);
+            score += (after - before).clamp(-20.0, 20.0) * if before < 65.0 { 0.35 } else { 0.14 };
+            score -= (28.0 - after).max(0.0) * 0.55;
+            let enemy_eye = [ex, ey, ez + 7.0];
+            for (fraction, weight) in [(0.38, 8.0), (0.72, 6.0), (1.0, 4.0)] {
+                let sample = offset(start, direction, travel * fraction);
+                let floor = arena.ground(sample);
+                if !arena.clear(enemy_eye, [sample[0], sample[1], floor + 7.0], 0.0, 0.0) {
+                    score += weight * if before < 70.0 { 1.0 } else { 0.5 };
+                }
+            }
+        }
+        if score > best.0 {
+            best = (score, end);
+        }
+    }
+    best.1
+}
+
 fn escape_goal(pos: Point, heading: f64, zone: Zone, safe_radius: f64) -> Point {
     let mut best = (f64::NEG_INFINITY, pos);
     for degrees in [0.0_f64, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0] {
@@ -685,5 +766,33 @@ mod tests {
         me["energy"] = json!(42);
         me["hp"] = json!(900);
         assert!(!can_duel(&me, &enemy, [0.0, 0.0]));
+    }
+
+    #[test]
+    fn escape_fan_picks_a_walkable_angle_that_breaks_sight() {
+        let arena =
+            Arena::flat_test((-7..-5).flat_map(|x| (2..7).map(move |y| ((x, y), [0.0, 15.0]))));
+        let me = json!({"pos":[0,0,0],"stats":{"radius":2.5,"height":9,"step_up":1.2,"max_slope_deg":50}});
+        let enemy = json!({"pos":[-36,0,0]});
+        let zone = Zone {
+            center: [0.0, 0.0],
+            radius: 85.0,
+            next: [0.0, 0.0],
+            next_radius: 70.0,
+            shrink_end: 100.0,
+        };
+        let goal = cover_escape(&arena, &me, 0.0, zone, 60.0, &[&enemy]);
+        assert!(goal[0] > 0.0);
+        assert!(!arena.clear([-36.0, 0.0, 7.0], [goal[0], goal[1], 7.0], 0.0, 0.0));
+        let travel = distance([0.0, 0.0], goal);
+        assert_eq!(
+            arena.travel(
+                [0.0, 0.0, 0.0],
+                unit(bearing([0.0, 0.0], goal)),
+                travel,
+                Body::from_stats(&me["stats"])
+            ),
+            travel
+        );
     }
 }
