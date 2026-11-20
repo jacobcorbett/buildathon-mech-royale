@@ -181,7 +181,27 @@ impl Bot {
         };
         let closest = |a: &&Value, b: &&Value| range(start, a).total_cmp(&range(start, b));
         let mut loot_target = None;
-        if !urgent && !danger {
+        let early_equip = pickup.filter(|(item, _)| {
+            let gap = range(start, item);
+            let item_pos = xy(&item["pos"]);
+            let safe_detour = safe(item)
+                || (distance(item_pos, zone.center) + 12.0 < zone.radius
+                    && distance(item_pos, zone.next) - safe_radius
+                        < walk * (zone.shrink_end - now - 13.0).max(0.0));
+            !urgent
+                && !injured
+                && safe_detour
+                && (!attacked || (gap < 11.0 && number(&me["hp"]) > 0.8 * number(&me["max_hp"])))
+                && (reach..=30.0).contains(&gap)
+                && items(&me["weapons"]).iter().any(Value::is_null)
+                && pressure.iter().all(|enemy| {
+                    range(start, enemy) > 14.0 && distance(xy(&enemy["pos"]), item_pos) > gap * 0.7
+                })
+        });
+        if let Some((item, _)) = early_equip {
+            goal = xy(&item["pos"]);
+            zone_destination = false;
+        } else if !urgent && !danger {
             let drop = items(&obs["drops"])
                 .iter()
                 .filter(|drop| {
@@ -241,15 +261,39 @@ impl Bot {
                 && distance(start, zone.next) < safe_radius
                 && can_finish(me, enemy, start)
         });
-        let fleeing = finish.is_none()
+        // A healthy gun/arc pair can defeat a lone gun pursuer faster by
+        // staying in arc range; still break contact against overlapping fire.
+        let duel = threat.filter(|enemy| {
+            !urgent
+                && !outside_buffer
+                && pressure
+                    .iter()
+                    .filter(|actor| range(start, actor) < 58.0)
+                    .count()
+                    == 1
+                && distance(start, zone.next) < safe_radius
+                && can_duel(me, enemy, start)
+                && self.arena.clear(
+                    [pos[0], pos[1], pos[2] + number(&stats["muzzle_height"])],
+                    [
+                        number(&enemy["pos"][0]),
+                        number(&enemy["pos"][1]),
+                        number(&enemy["pos"][2]) + 4.5,
+                    ],
+                    0.0,
+                    0.0,
+                )
+        });
+        let engagement = finish.or(duel);
+        let fleeing = engagement.is_none()
             && (attacked
                 || threat.is_some_and(|enemy| {
                     injured || pressure.len() > 1 || range(start, enemy) < 65.0
                 }));
-        if let Some(enemy) = finish {
+        if let Some(enemy) = engagement {
             let enemy_pos = xy(&enemy["pos"]);
             let toward = bearing(start, enemy_pos);
-            let radial = ((range(start, enemy) - 29.0) * 0.55).clamp(-10.0, 10.0);
+            let radial = ((range(start, enemy) - 30.0) * 0.75).clamp(-13.0, 13.0);
             goal = offset(
                 offset(start, unit(toward), radial),
                 unit(toward + self.side * PI / 2.0),
@@ -261,7 +305,7 @@ impl Bot {
             threat.map_or(self.attacker_yaw, |enemy| bearing(start, xy(&enemy["pos"]))) + PI
         });
         if let Some(yaw) = away {
-            if !urgent && zone.next_radius > 0.0 {
+            if early_equip.is_none() && !urgent && zone.next_radius > 0.0 {
                 goal = escape_goal(start, yaw, zone, safe_radius);
                 zone_destination = false;
             }
@@ -309,7 +353,17 @@ impl Bot {
             self.jet_until = now + 1.4;
             self.jet_retry = now + 7.0;
         }
-        let reserve = if urgent { 0.14 } else { 0.28 };
+        let arc_in_range = threat.is_some_and(|enemy| range(start, enemy) < 44.0)
+            && items(&me["weapons"])
+                .iter()
+                .any(|weapon| weapon["kind"] == "lightning");
+        let reserve = if urgent {
+            0.14
+        } else if arc_in_range && !injured {
+            0.52
+        } else {
+            0.28
+        };
         let boost = if jump || !grounded {
             self.sprinting = false;
             battery > reserve && (jump || now < self.jet_until)
@@ -328,7 +382,7 @@ impl Bot {
         action["jump"] = json!(jump);
         action["boost"] = json!(boost);
 
-        let mut targets: Vec<_> = if let Some(enemy) = finish {
+        let mut targets: Vec<_> = if let Some(enemy) = engagement {
             vec![enemy]
         } else if let Some(item) = loot_target {
             vec![item]
@@ -486,6 +540,22 @@ fn magnitude([x, y]: Point) -> f64 {
     x.hypot(y)
 }
 
+fn can_duel(me: &Value, enemy: &Value, start: Point) -> bool {
+    let weapons = items(&enemy["weapons"]);
+    let hp = number(&me["hp"]);
+    let enemy_hp = enemy["hp"].as_f64().unwrap_or(1400.0);
+    enemy["kind"] == "mech"
+        && !weapons.is_empty()
+        && weapons.iter().all(|weapon| weapon == "gun")
+        && range(start, enemy) < 57.0
+        && hp >= 0.62 * number(&me["max_hp"])
+        && hp + 180.0 >= enemy_hp
+        && number(&me["energy"]) > 16.0
+        && items(&me["weapons"])
+            .iter()
+            .any(|weapon| weapon["kind"] == "lightning" && number(&weapon["cooldown"]) < 0.4)
+}
+
 // Close out a weakened opponent only while healthy and already inside the safe ring.
 fn can_finish(me: &Value, enemy: &Value, start: Point) -> bool {
     let max_hp = enemy["max_hp"].as_f64().unwrap_or(1400.0);
@@ -599,5 +669,21 @@ mod tests {
         assert!(!can_finish(&injured, &enemy, [0.0, 0.0]));
         let unknown = json!({"kind":"mech","pos":[40,0,0]});
         assert!(!can_finish(&me, &unknown, [0.0, 0.0]));
+    }
+
+    #[test]
+    fn duel_requires_an_energy_and_weapon_advantage() {
+        let mut me = json!({"hp":1300,"max_hp":1400,"energy":42,
+            "weapons":[{"kind":"gun"},{"kind":"lightning","cooldown":0.0}]});
+        let mut enemy = json!({"kind":"mech","hp":1400,"pos":[42,0,0],"weapons":["gun"]});
+        assert!(can_duel(&me, &enemy, [0.0, 0.0]));
+        enemy["weapons"] = json!(["gun", "mortar"]);
+        assert!(!can_duel(&me, &enemy, [0.0, 0.0]));
+        enemy["weapons"] = json!(["gun"]);
+        me["energy"] = json!(10);
+        assert!(!can_duel(&me, &enemy, [0.0, 0.0]));
+        me["energy"] = json!(42);
+        me["hp"] = json!(900);
+        assert!(!can_duel(&me, &enemy, [0.0, 0.0]));
     }
 }

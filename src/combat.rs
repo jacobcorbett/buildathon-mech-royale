@@ -208,7 +208,12 @@ pub fn attack(
                 _ => 0.0,
             };
             if attacker.is_some() && attacker == value["id"].as_u64() {
-                score += 7.0;
+                score += 9.0;
+            }
+            if kind == "mech" {
+                if let Some(hp) = value["hp"].as_f64() {
+                    score += 34.0 * (1.0 - hp / 850.0).clamp(0.0, 1.0);
+                }
             }
             if best.as_ref().is_none_or(|(old, _, _)| score > *old) {
                 best = Some((score, shot.aim, fire));
